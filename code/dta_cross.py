@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv, GINEConv, global_mean_pool
@@ -66,23 +67,6 @@ class ProteinEncoder(nn.Module):
         outputs = self.model(**tokens)
         return outputs.last_hidden_state[:, 0, :]
 
-class InteractionLayer(nn.Module):
-    def __init__(self, hidden_dim):
-        super(InteractionLayer, self).__init__()
-        self.interaction_fc = nn.Linear(2 * hidden_dim, hidden_dim)  # Interaction between protein and drug
-        self.attention_fc = nn.Linear(hidden_dim, 1)  # Attention mechanism
-        
-    def forward(self, protein_embedding, drug_embedding):
-        interaction = protein_embedding * drug_embedding
-        # Concatenate protein and drug embeddings with the interaction
-        combined = torch.cat([protein_embedding, drug_embedding, interaction], dim=-1)
-        # Pass through a fully connected layer to learn interactions
-        interaction_output = torch.relu(self.interaction_fc(combined))
-        # Compute attention scores for better fusion
-        attention_scores = softmax(self.attention_fc(interaction_output), dim=-1)
-        return interaction_output * attention_scores
-
-
 
 class GNNEncoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, edge_dim):
@@ -113,12 +97,42 @@ class GNNEncoder(nn.Module):
         return global_mean_pool(x, batch)
         # return global_mean_pool(x, torch.zeros(x.size(0), dtype=torch.long))
 
+class CrossLayer(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super(CrossLayer, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, 1)
+        self.relu = nn.ReLU()
+
+    def forward(self, protein_embedding, drug_embedding):
+        if protein_embedding.size(1) != drug_embedding.size(1):
+            max_dim = max(protein_embedding.size(1), drug_embedding.size(1))
+            protein_embedding = torch.cat([protein_embedding, torch.zeros(protein_embedding.size(0), max_dim - protein_embedding.size(1)).to(protein_embedding.device)], dim=-1)
+            drug_embedding = torch.cat([drug_embedding, torch.zeros(drug_embedding.size(0), max_dim - drug_embedding.size(1)).to(drug_embedding.device)], dim=-1)
+        
+        cross_product = protein_embedding * drug_embedding  # element-wise
+        
+        concatenated = torch.cat([protein_embedding, drug_embedding, cross_product], dim=-1)
+        input_dim = concatenated.size(1)
+        
+        x = self.fc1(concatenated)
+        x = self.relu(x)
+        x = self.fc2(x)
+        x = self.relu(x)
+        interaction = self.fc3(x)
+        
+        return interaction
+
+
 class AffinityPredictionModel(nn.Module):
     def __init__(self, protein_dim, drug_dim, hidden_dim):
         super(AffinityPredictionModel, self).__init__()
         self.protein_encoder = ProteinEncoder()
         self.drug_encoder = GNNEncoder(input_dim=4, hidden_dim=hidden_dim, output_dim=drug_dim, edge_dim=3)
-        self.fc = nn.Linear(protein_dim + drug_dim, 1)
+        cross_dim = max(protein_dim, drug_dim) * 3
+        self.cross_layer = CrossLayer(input_dim=cross_dim, hidden_dim=hidden_dim)
+        self.fc = nn.Linear(protein_dim + drug_dim + 1, 1)
 
     def forward(self, protein_seq, drug_graph):
         protein_embedding = self.protein_encoder(protein_seq)
@@ -136,7 +150,8 @@ class AffinityPredictionModel(nn.Module):
         assert protein_embedding.size(0) == drug_embedding.size(0), \
             f"Batch size mismatch: {protein_embedding.size(0)} (protein) vs {drug_embedding.size(0)} (drug)"
             
-        combined = torch.cat([protein_embedding, drug_embedding], dim=-1)
+        cross = self.cross_layer(protein_embedding, drug_embedding) # 1024
+        combined = torch.cat([protein_embedding, drug_embedding, cross], dim=-1)
         return self.fc(combined).squeeze()
 
 # Load Dataset
