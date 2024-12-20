@@ -159,22 +159,34 @@ class CrossAttentionLayer(nn.Module):
         return self.fusion_fc(combined)
 
 
-class BilinearPoolingLayer(nn.Module):
-    def __init__(self, protein_dim, drug_dim, hidden_dim=512):
-        super(BilinearPoolingLayer, self).__init__()
-        self.protein_linear = nn.Linear(protein_dim, hidden_dim)
-        self.drug_linear = nn.Linear(drug_dim, hidden_dim)
-        self.fc = nn.Linear(hidden_dim * hidden_dim, 1)  # Output a scalar value
-    
-    def forward(self, protein, drug):
-        # Transform embeddings to the hidden space
-        protein_proj = self.protein_linear(protein)
-        drug_proj = self.drug_linear(drug)
+class CapsuleLayer(nn.Module):
+    def __init__(self, input_dim, output_dim, num_capsules, routing_iterations=3):
+        super(CapsuleLayer, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.num_capsules = num_capsules
+        self.routing_iterations = routing_iterations
         
-        # Perform bilinear interaction (outer product)
-        bilinear_interaction = torch.matmul(protein_proj.unsqueeze(1), drug_proj.unsqueeze(2))
+        # Capsule layer matrix for routing (dynamic routing)
+        self.weights = nn.Parameter(torch.randn(input_dim, num_capsules, output_dim))
+
+    def squash(self, x):
+        squared_norm = (x ** 2).sum(-1, keepdim=True)
+        scale = squared_norm / (1 + squared_norm)
+        return scale * x / torch.sqrt(squared_norm)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        x_reshaped = x.unsqueeze(2)
+        u = torch.einsum('bij,jkl->bkl', x_reshaped, self.weights)  # [batch_size, num_capsules, output_dim]
         
-        # Flatten and pass through a fully connected layer to reduce to a scalar value
-        bilinear_interaction = bilinear_interaction.view(bilinear_interaction.size(0), -1)
-        fused_representation = self.fc(bilinear_interaction)
-        return fused_representation
+        # dynamic routing
+        b = torch.zeros(batch_size, self.num_capsules, self.output_dim, device=x.device)  # [batch_size, num_capsules, output_dim]
+        
+        for _ in range(self.routing_iterations):
+            c = F.softmax(b, dim=1)
+            s = (c * u).sum(dim=1)
+            v = self.squash(s)
+            b = b + (u * v.unsqueeze(1)).sum(dim=-1, keepdim=True)
+        
+        return v

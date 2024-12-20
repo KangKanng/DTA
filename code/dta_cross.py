@@ -57,16 +57,24 @@ def smiles_to_graph(smiles):
 
 
 class AffinityPredictionModel(nn.Module):
-    def __init__(self, protein_dim, drug_dim, hidden_dim, attention_dim):
+    def __init__(self, protein_dim, drug_dim, hidden_dim, attention_dim, capsule_dim):
         super(AffinityPredictionModel, self).__init__()
         self.protein_encoder = ProteinEncoder()
         self.drug_encoder = GNNEncoder(input_dim=4, hidden_dim=hidden_dim, output_dim=drug_dim, edge_dim=3)
+        
+        # Cross Layer
         cross_dim = max(protein_dim, drug_dim) * 3
         self.cross_layer = CrossLayer(input_dim=cross_dim, hidden_dim=hidden_dim)
-        self.attention_layer = CrossAttentionLayer(protein_dim, drug_dim, attention_dim, attention_dim)
-        self.self_attention = SelfAttentionLayer(input_dim=drug_dim, attention_dim=attention_dim)
         
-        output_dim = protein_dim + drug_dim + 1 + attention_dim
+        # Attention Layer
+        self.attention_layer = CrossAttentionLayer(protein_dim, drug_dim, attention_dim, attention_dim) # cross-attn
+        self.self_attention = SelfAttentionLayer(input_dim=drug_dim, attention_dim=attention_dim) # self-attn
+        
+        # Capsule Layer
+        self.protein_capsule = CapsuleLayer(input_dim=protein_dim, output_dim=capsule_dim, num_capsules=8)
+        self.drug_capsule = CapsuleLayer(input_dim=drug_dim, output_dim=capsule_dim, num_capsules=8)
+        
+        output_dim = protein_dim + drug_dim + 1 + attention_dim + attention_dim * 2
         self.fc1 = nn.Linear(output_dim, output_dim // 2) 
         self.fc2 = nn.Linear(output_dim // 2, output_dim // 4)
         self.fc3 = nn.Linear(output_dim // 4, 1)
@@ -94,7 +102,11 @@ class AffinityPredictionModel(nn.Module):
         self_attn = self.self_attention(drug_embedding) # Self
         # print("Attention output shape:", attention_output.shape)
         # print("Attention weight shape:", attention_weights.shape)
-        combined = torch.cat([protein_embedding, drug_embedding, cross, attention_output], dim=-1)
+
+        protein_caps = self.protein_capsule(protein_embedding)
+        drug_caps = self.drug_capsule(drug_embedding)
+        
+        combined = torch.cat([protein_embedding, drug_embedding, cross, attention_output, protein_caps, drug_caps], dim=-1)
         
         x = self.fc1(combined)
         x = torch.relu(x)
@@ -331,7 +343,7 @@ if __name__ == "__main__":
 
 
     # Initialize model
-    model = AffinityPredictionModel(protein_dim=1024, drug_dim=256, hidden_dim=64, attention_dim=512).to(device)
+    model = AffinityPredictionModel(protein_dim=1024, drug_dim=256, hidden_dim=64, attention_dim=512, capsule_dim=512).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.MSELoss()
     
