@@ -12,11 +12,13 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
+from lifelines.utils import concordance_index
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
 import os
 import networkx as nx
+import matplotlib.pyplot as plt
 
 # Data Preprocessing
 def smiles_to_graph(smiles):
@@ -125,57 +127,90 @@ class CrossLayer(nn.Module):
         return interaction
 
 
-class AttentionLayer(nn.Module):
-    def __init__(self, protein_dim, drug_dim, hidden_dim):
-        super(AttentionLayer, self).__init__()
-        
-        self.query_linear = nn.Linear(protein_dim, hidden_dim)
-        self.key_linear = nn.Linear(drug_dim, hidden_dim)
-        self.value_linear = nn.Linear(drug_dim, hidden_dim)
-        self.output_linear = nn.Linear(hidden_dim, protein_dim)
-        self.softmax = nn.Softmax(dim=-1)
-
-    def forward(self, protein_embedding, drug_embedding):
-        query = self.query_linear(protein_embedding)
-        key = self.key_linear(drug_embedding)  # (batch_size, drug_dim) -> (batch_size, hidden_dim)
-        value = self.value_linear(drug_embedding)  # (batch_size, drug_dim) -> (batch_size, hidden_dim)
-        attention_scores = torch.matmul(query, key.transpose(-2, -1))  # (batch_size, hidden_dim) x (batch_size, hidden_dim).T = (batch_size, 1, seq_len)
-        attention_scores = attention_scores / torch.sqrt(torch.tensor(query.size(-1), dtype=torch.float32))  # Scale
-        attention_weights = self.softmax(attention_scores)  # (batch_size, 1, seq_len)
-        attention_output = torch.matmul(attention_weights, value)  # (batch_size, 1, seq_len) x (batch_size, seq_len, hidden_dim) -> (batch_size, 1, hidden_dim)
-        output = self.output_linear(attention_output.squeeze(1))  # (batch_size, hidden_dim) -> (batch_size, protein_dim)
-        
-        return output, attention_weights
-    
-    
-class CrossAttentionLayer(nn.Module):
-    def __init__(self, protein_dim, drug_dim, attention_dim):
-        super(CrossAttentionLayer, self).__init__()
-        self.protein_proj = nn.Linear(protein_dim, attention_dim)
-        self.drug_proj = nn.Linear(drug_dim, attention_dim)
-        
+class SelfAttentionLayer(nn.Module):
+    def __init__(self, input_dim, attention_dim):
+        super(SelfAttentionLayer, self).__init__()
+        self.query_proj = nn.Linear(input_dim, attention_dim)
+        self.key_proj = nn.Linear(input_dim, attention_dim)
+        self.value_proj = nn.Linear(input_dim, attention_dim)
         self.attention = nn.MultiheadAttention(embed_dim=attention_dim, num_heads=4, dropout=0.1)
 
-    def forward(self, protein_embedding, drug_embedding):
-        protein_proj = self.protein_proj(protein_embedding)  # (batch_size, attention_dim)
-        drug_proj = self.drug_proj(drug_embedding)  # (batch_size, attention_dim)
+    def forward(self, x):
+        query = self.query_proj(x).unsqueeze(0)
+        key = self.key_proj(x).unsqueeze(0)
+        value = self.value_proj(x).unsqueeze(0)
 
-        protein_proj = protein_proj.unsqueeze(0)  # (1, batch_size, attention_dim)
-        drug_proj = drug_proj.unsqueeze(0)  # (1, batch_size, attention_dim)
+        # MHA
+        attention_output, _ = self.attention(query, key, value)
+        return attention_output.squeeze(0)
+    
+    
+# # Cross Modality Attention
+# class CrossAttentionLayer(nn.Module):
+#     def __init__(self, protein_dim, drug_dim, attention_dim):
+#         super(CrossAttentionLayer, self).__init__()
+#         self.protein_proj = nn.Linear(protein_dim, attention_dim)
+#         self.drug_proj = nn.Linear(drug_dim, attention_dim)
+        
+#         self.attention = nn.MultiheadAttention(embed_dim=attention_dim, num_heads=4, dropout=0.1)
 
-        # Q: protein; K/V: drug
-        attention_output, attention_weights = self.attention(protein_proj, drug_proj, drug_proj)
-        return attention_output.squeeze(0), attention_weights.squeeze(0) # (1, batch_size, attention_dim)
+#     def forward(self, protein_embedding, drug_embedding):
+#         protein_proj = self.protein_proj(protein_embedding)  # (batch_size, attention_dim)
+#         drug_proj = self.drug_proj(drug_embedding)  # (batch_size, attention_dim)
 
-def visualize_attention(attention_weights, protein_seq, drug_graph):
-    attention_weights = attention_weights.detach().cpu().numpy()
+#         protein_proj = protein_proj.unsqueeze(0)  # (1, batch_size, attention_dim)
+#         drug_proj = drug_proj.unsqueeze(0)  # (1, batch_size, attention_dim)
 
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(attention_weights, cmap='viridis', annot=True, xticklabels=protein_seq, yticklabels=drug_graph.node_labels, cbar=True)
-    plt.title("Attention Map (Protein vs. Drug)")
-    plt.xlabel("Protein Sequence")
-    plt.ylabel("Drug Molecular Graph")
-    plt.show()
+#         # Q: protein; K/V: drug
+#         attention_output, attention_weights = self.attention(protein_proj, drug_proj, drug_proj)
+#         return attention_output.squeeze(0), attention_weights.squeeze(0) # (1, batch_size, attention_dim)
+
+
+class CrossAttentionLayer(nn.Module):
+    def __init__(self, protein_dim, drug_dim, hidden_dim=512, fusion_dim=512):
+        super(CrossAttentionLayer, self).__init__()
+        self.protein_query = nn.Linear(protein_dim, hidden_dim)
+        self.drug_query = nn.Linear(drug_dim, hidden_dim)
+        
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads=8)
+        self.protein_output = nn.Linear(hidden_dim, protein_dim)
+        self.drug_output = nn.Linear(hidden_dim, drug_dim)
+        self.fusion_fc = nn.Linear(protein_dim + drug_dim, fusion_dim)
+        
+    def forward(self, protein, drug):
+        protein_query = self.protein_query(protein).unsqueeze(0)
+        drug_query = self.drug_query(drug).unsqueeze(0)
+
+        protein_attention, _ = self.attn(protein_query, drug_query, drug_query)
+        drug_attention, _ = self.attn(drug_query, protein_query, protein_query)
+
+        fused_protein = self.protein_output(protein_attention.squeeze(0))
+        fused_drug = self.drug_output(drug_attention.squeeze(0))
+
+        combined = torch.cat([fused_protein, fused_drug], dim=-1)
+        return self.fusion_fc(combined)
+
+
+class BilinearPoolingLayer(nn.Module):
+    def __init__(self, protein_dim, drug_dim, hidden_dim=512):
+        super(BilinearPoolingLayer, self).__init__()
+        self.protein_linear = nn.Linear(protein_dim, hidden_dim)
+        self.drug_linear = nn.Linear(drug_dim, hidden_dim)
+        self.fc = nn.Linear(hidden_dim * hidden_dim, 1)  # Output a scalar value
+    
+    def forward(self, protein, drug):
+        # Transform embeddings to the hidden space
+        protein_proj = self.protein_linear(protein)
+        drug_proj = self.drug_linear(drug)
+        
+        # Perform bilinear interaction (outer product)
+        bilinear_interaction = torch.matmul(protein_proj.unsqueeze(1), drug_proj.unsqueeze(2))
+        
+        # Flatten and pass through a fully connected layer to reduce to a scalar value
+        bilinear_interaction = bilinear_interaction.view(bilinear_interaction.size(0), -1)
+        fused_representation = self.fc(bilinear_interaction)
+        return fused_representation
+
 
 
 class AffinityPredictionModel(nn.Module):
@@ -185,7 +220,8 @@ class AffinityPredictionModel(nn.Module):
         self.drug_encoder = GNNEncoder(input_dim=4, hidden_dim=hidden_dim, output_dim=drug_dim, edge_dim=3)
         cross_dim = max(protein_dim, drug_dim) * 3
         self.cross_layer = CrossLayer(input_dim=cross_dim, hidden_dim=hidden_dim)
-        self.attention_layer = CrossAttentionLayer(protein_dim, drug_dim, attention_dim)
+        self.attention_layer = CrossAttentionLayer(protein_dim, drug_dim, attention_dim, attention_dim)
+        self.self_attention = SelfAttentionLayer(input_dim=drug_dim, attention_dim=attention_dim)
         
         output_dim = protein_dim + drug_dim + 1 + attention_dim
         self.fc1 = nn.Linear(output_dim, output_dim // 2) 
@@ -211,7 +247,10 @@ class AffinityPredictionModel(nn.Module):
             f"Batch size mismatch: {protein_embedding.size(0)} (protein) vs {drug_embedding.size(0)} (drug)"
             
         cross = self.cross_layer(protein_embedding, drug_embedding)
-        attention_output, attention_weights = self.attention_layer(protein_embedding, drug_embedding)
+        attention_output = self.attention_layer(protein_embedding, drug_embedding) # Cross
+        self_attn = self.self_attention(drug_embedding) # Self
+        # print("Attention output shape:", attention_output.shape)
+        # print("Attention weight shape:", attention_weights.shape)
         combined = torch.cat([protein_embedding, drug_embedding, cross, attention_output], dim=-1)
         
         x = self.fc1(combined)
@@ -318,7 +357,7 @@ def load_checkpoint(model, optimizer, checkpoint_path):
 
 
 class EarlyStopping:
-    def __init__(self, patience=5, verbose=False, checkpoint_path="E:/AIDD_project/checkpoints/best_model.pt"):
+    def __init__(self, patience=5, verbose=False, checkpoint_path="E:/AIDD_project/checkpoints/early_stop"):
         """
         Args:
             patience (int): Number of epochs to wait for improvement before stopping.
@@ -359,10 +398,12 @@ def compute_metrics(y_true, y_pred):
     mse = mean_squared_error(y_true, y_pred)
     rmse = np.sqrt(mse)
     r2 = r2_score(y_true, y_pred)
+    ci = concordance_index(y_true, y_pred)
     return {
         "MSE": mse,
         "RMSE": rmse,
-        "R^2": r2
+        "R^2": r2,
+        "CI": ci
     }
 
 def log_file(epoch, train_loss, test_loss, metrics, file_path):
@@ -447,22 +488,22 @@ if __name__ == "__main__":
 
 
     # Initialize model
-    model = AffinityPredictionModel(protein_dim=1024, drug_dim=128, hidden_dim=64, attention_dim=512).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    model = AffinityPredictionModel(protein_dim=1024, drug_dim=256, hidden_dim=64, attention_dim=512).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.MSELoss()
     
     checkpoint_dir = "E:/AIDD_project/checkpoints"
     best_loss = float('inf')
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    early_stopping = EarlyStopping(patience=3, verbose=True, checkpoint_path=os.path.join(checkpoint_dir, "best_model.pt"))
+    early_stopping = EarlyStopping(patience=5, verbose=True)
     
     start_epoch = -1
     
     # # load
     # model, optimizer, start_epoch, _ = load_checkpoint(model, optimizer, "E:/AIDD_project/checkpoints/epoch_2_loss_0.7925.pt")
     
-    log_file_path = "training_log.json"
+    log_file_path = "training_log.txt"
 
     # Training loop
     epochs = 10 # 50
@@ -483,18 +524,18 @@ if __name__ == "__main__":
         
         
         print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}")
-        print(f"Metrics: MSE: {test_metrics['MSE']:.4f}, RMSE: {test_metrics['RMSE']:.4f}, R^2: {test_metrics['R^2']:.4f}")
+        print(f"Metrics: MSE: {test_metrics['MSE']:.4f}, RMSE: {test_metrics['RMSE']:.4f}, R^2: {test_metrics['R^2']:.4f}, CI: {test_metrics['CI']:.4f}")
         
-        mse, rmse, r2 = test_metrics['MSE'], test_metrics['RMSE'], test_metrics['R^2']
-        metrics = {"MSE": mse, "RMSE": rmse, "R²": r2}
+        mse, rmse, r2, ci = test_metrics['MSE'], test_metrics['RMSE'], test_metrics['R^2'], test_metrics['CI']
+        metrics = {"MSE": mse, "RMSE": rmse, "R²": r2, "CI": ci}
         log_file(epoch + 1, train_loss, test_loss, metrics, log_file_path)
         
         save_checkpoint(model, optimizer, epoch, test_loss, checkpoint_dir)
 
-        # best chkpt
-        if test_loss < best_loss:
-            best_loss = test_loss
-            save_checkpoint(model, optimizer, epoch, test_loss, os.path.join(checkpoint_dir, "best_model.pt"))
+        # # best chkpt
+        # if test_loss < best_loss:
+        #     best_loss = test_loss
+        #     save_checkpoint(model, optimizer, epoch, test_loss, os.path.join(checkpoint_dir, "best_model.pt"))
             
         early_stopping(test_loss, model, optimizer, epoch)
         if early_stopping.early_stop:
