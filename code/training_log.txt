@@ -1,2 +1,5 @@
 Epoch 1: Train Loss = 1.0991, Test Loss = 0.7934, MSE = 0.7934, RMSE = 0.8907, R² = -0.0078
 Epoch 1: Train Loss = 1.4262, Test Loss = 0.7814, MSE = 0.7814, RMSE = 0.8840, R² = 0.0074
+Epoch 1: Train Loss = 1.0045, Test Loss = 0.7494, MSE = 0.7494, RMSE = 0.8657, R² = 0.0481
+Epoch 1: Train Loss = 1.7310, Test Loss = 0.7568, MSE = 0.7568, RMSE = 0.8699, R² = 0.0386
+Epoch 2: Train Loss = 0.9149, Test Loss = 0.7147, MSE = 0.7147, RMSE = 0.8454, R² = 0.0921

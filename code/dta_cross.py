@@ -137,6 +137,7 @@ def load_dataset(file_path):
 def train_model(model, data_loader, optimizer, criterion, device):
     model.train()
     total_loss = 0
+    loss_fn = WeightedMSELoss(weight=10)
     
     with tqdm(data_loader, desc="Training", unit="batch") as pbar:
         for batch in pbar:
@@ -148,7 +149,8 @@ def train_model(model, data_loader, optimizer, criterion, device):
 
             optimizer.zero_grad()
             predictions = model(sequences, graphs)
-            loss = criterion(predictions, affinities)
+            # loss = criterion(predictions, affinities)
+            loss = loss_fn(predictions, affinities)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -212,7 +214,7 @@ def load_checkpoint(model, optimizer, checkpoint_path):
 
 
 class EarlyStopping:
-    def __init__(self, patience=5, verbose=False, checkpoint_path="E:/AIDD_project/checkpoints/early_stop"):
+    def __init__(self, patience=5, verbose=False, checkpoint_dir="E:/AIDD_project/checkpoints/early_stop"):
         """
         Args:
             patience (int): Number of epochs to wait for improvement before stopping.
@@ -224,7 +226,7 @@ class EarlyStopping:
         self.best_loss = float('inf')
         self.counter = 0
         self.early_stop = False
-        self.checkpoint_path = checkpoint_path
+        self.checkpoint_path = os.path.join(checkpoint_dir, "best_model.pt")
 
     def __call__(self, val_loss, model, optimizer, epoch):
         if val_loss < self.best_loss:
@@ -276,6 +278,27 @@ def save_predictions(smiles, sequences, predictions, ground_truths, output_path)
     df = pd.DataFrame(data)
     df.to_csv(output_path, index=False)
     print(f"Predictions saved to {output_path}")
+
+def plot_affinity_scatter(predictions, ground_truths, output_file="affinity_scatter_plot.png"):
+    plt.figure(figsize=(8, 8))
+    plt.scatter(predictions, ground_truths, alpha=0.7, edgecolor='k')
+    plt.plot([min(ground_truths), max(ground_truths)],
+             [min(ground_truths), max(ground_truths)], 'r--', lw=2)  # Line y=x for reference
+    plt.title("Affinity Predictions vs Ground Truths", fontsize=14)
+    plt.xlabel("Predicted Affinity", fontsize=12)
+    plt.ylabel("Ground Truth Affinity", fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    # plt.show()
+    
+class WeightedMSELoss(nn.Module):
+    def __init__(self, weight=10):
+        super(WeightedMSELoss, self).__init__()
+        self.weight = weight
+
+    def forward(self, preds, targets):
+        weights = torch.where(targets > 5, self.weight, 1.0)
+        return torch.mean(weights * (preds - targets) ** 2)
 
 
 # Main Execution
@@ -366,6 +389,8 @@ if __name__ == "__main__":
         print(f"Epoch {epoch + 1}/{epochs}")
         train_loss = train_model(model, train_loader, optimizer, criterion, device)
         test_loss, test_metrics, predictions, ground_truths = evaluate_model(model, test_loader, criterion, device, return_predictions=True)
+        
+        plot_affinity_scatter(predictions, ground_truths, f"affinity_scatter_epoch_{epoch+1}.png")
         
         # Save predictions
         if epoch == epochs - 1:
