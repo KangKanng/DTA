@@ -125,14 +125,74 @@ class CrossLayer(nn.Module):
         return interaction
 
 
-class AffinityPredictionModel(nn.Module):
+class AttentionLayer(nn.Module):
     def __init__(self, protein_dim, drug_dim, hidden_dim):
+        super(AttentionLayer, self).__init__()
+        
+        self.query_linear = nn.Linear(protein_dim, hidden_dim)
+        self.key_linear = nn.Linear(drug_dim, hidden_dim)
+        self.value_linear = nn.Linear(drug_dim, hidden_dim)
+        self.output_linear = nn.Linear(hidden_dim, protein_dim)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, protein_embedding, drug_embedding):
+        query = self.query_linear(protein_embedding)
+        key = self.key_linear(drug_embedding)  # (batch_size, drug_dim) -> (batch_size, hidden_dim)
+        value = self.value_linear(drug_embedding)  # (batch_size, drug_dim) -> (batch_size, hidden_dim)
+        attention_scores = torch.matmul(query, key.transpose(-2, -1))  # (batch_size, hidden_dim) x (batch_size, hidden_dim).T = (batch_size, 1, seq_len)
+        attention_scores = attention_scores / torch.sqrt(torch.tensor(query.size(-1), dtype=torch.float32))  # Scale
+        attention_weights = self.softmax(attention_scores)  # (batch_size, 1, seq_len)
+        attention_output = torch.matmul(attention_weights, value)  # (batch_size, 1, seq_len) x (batch_size, seq_len, hidden_dim) -> (batch_size, 1, hidden_dim)
+        output = self.output_linear(attention_output.squeeze(1))  # (batch_size, hidden_dim) -> (batch_size, protein_dim)
+        
+        return output, attention_weights
+    
+    
+class CrossAttentionLayer(nn.Module):
+    def __init__(self, protein_dim, drug_dim, attention_dim):
+        super(CrossAttentionLayer, self).__init__()
+        self.protein_proj = nn.Linear(protein_dim, attention_dim)
+        self.drug_proj = nn.Linear(drug_dim, attention_dim)
+        
+        self.attention = nn.MultiheadAttention(embed_dim=attention_dim, num_heads=4, dropout=0.1)
+
+    def forward(self, protein_embedding, drug_embedding):
+        protein_proj = self.protein_proj(protein_embedding)  # (batch_size, attention_dim)
+        drug_proj = self.drug_proj(drug_embedding)  # (batch_size, attention_dim)
+
+        protein_proj = protein_proj.unsqueeze(0)  # (1, batch_size, attention_dim)
+        drug_proj = drug_proj.unsqueeze(0)  # (1, batch_size, attention_dim)
+
+        # Q: protein; K/V: drug
+        attention_output, attention_weights = self.attention(protein_proj, drug_proj, drug_proj)
+        return attention_output.squeeze(0), attention_weights.squeeze(0) # (1, batch_size, attention_dim)
+
+def visualize_attention(attention_weights, protein_seq, drug_graph):
+    attention_weights = attention_weights.detach().cpu().numpy()
+
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(attention_weights, cmap='viridis', annot=True, xticklabels=protein_seq, yticklabels=drug_graph.node_labels, cbar=True)
+    plt.title("Attention Map (Protein vs. Drug)")
+    plt.xlabel("Protein Sequence")
+    plt.ylabel("Drug Molecular Graph")
+    plt.show()
+
+
+class AffinityPredictionModel(nn.Module):
+    def __init__(self, protein_dim, drug_dim, hidden_dim, attention_dim):
         super(AffinityPredictionModel, self).__init__()
         self.protein_encoder = ProteinEncoder()
         self.drug_encoder = GNNEncoder(input_dim=4, hidden_dim=hidden_dim, output_dim=drug_dim, edge_dim=3)
         cross_dim = max(protein_dim, drug_dim) * 3
         self.cross_layer = CrossLayer(input_dim=cross_dim, hidden_dim=hidden_dim)
-        self.fc = nn.Linear(protein_dim + drug_dim + 1, 1)
+        self.attention_layer = CrossAttentionLayer(protein_dim, drug_dim, attention_dim)
+        
+        output_dim = protein_dim + drug_dim + 1 + attention_dim
+        self.fc1 = nn.Linear(output_dim, output_dim // 2) 
+        self.fc2 = nn.Linear(output_dim // 2, output_dim // 4)
+        self.fc3 = nn.Linear(output_dim // 4, 1)
+        self.dropout = nn.Dropout(p=0.2)
+        # self.fc = nn.Linear(output_dim, 1)
 
     def forward(self, protein_seq, drug_graph):
         protein_embedding = self.protein_encoder(protein_seq)
@@ -150,9 +210,20 @@ class AffinityPredictionModel(nn.Module):
         assert protein_embedding.size(0) == drug_embedding.size(0), \
             f"Batch size mismatch: {protein_embedding.size(0)} (protein) vs {drug_embedding.size(0)} (drug)"
             
-        cross = self.cross_layer(protein_embedding, drug_embedding) # 1024
-        combined = torch.cat([protein_embedding, drug_embedding, cross], dim=-1)
-        return self.fc(combined).squeeze()
+        cross = self.cross_layer(protein_embedding, drug_embedding)
+        attention_output, attention_weights = self.attention_layer(protein_embedding, drug_embedding)
+        combined = torch.cat([protein_embedding, drug_embedding, cross, attention_output], dim=-1)
+        
+        x = self.fc1(combined)
+        x = torch.relu(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        x = torch.relu(x)
+        x = self.dropout(x)
+        x = self.fc3(x)
+        
+        # return self.fc(combined).squeeze()
+        return x.squeeze()
 
 # Load Dataset
 def load_dataset(file_path):
@@ -367,8 +438,8 @@ if __name__ == "__main__":
         affinities = torch.tensor([item[2] for item in batch], dtype=torch.float)
         return graphs, sequences, affinities
 
-    train_loader = DataLoader(train_data, batch_size=16, shuffle=True, collate_fn=custom_collate)
-    test_loader = DataLoader(test_data, batch_size=16, shuffle=False, collate_fn=custom_collate)
+    train_loader = DataLoader(train_data, batch_size=32, shuffle=True, collate_fn=custom_collate)
+    test_loader = DataLoader(test_data, batch_size=32, shuffle=False, collate_fn=custom_collate)
     
     # for batch in train_loader:
     #     print(batch)
@@ -376,7 +447,7 @@ if __name__ == "__main__":
 
 
     # Initialize model
-    model = AffinityPredictionModel(protein_dim=1024, drug_dim=128, hidden_dim=64).to(device)
+    model = AffinityPredictionModel(protein_dim=1024, drug_dim=128, hidden_dim=64, attention_dim=512).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     criterion = nn.MSELoss()
     
