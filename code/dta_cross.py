@@ -20,41 +20,7 @@ import os
 import networkx as nx
 import matplotlib.pyplot as plt
 from layers import *
-
-# Data Preprocessing
-def smiles_to_graph(smiles):
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return None
-    G = nx.Graph()
-    
-    node_features = []
-    for atom in mol.GetAtoms():
-        atomic_num = atom.GetAtomicNum()
-        hybridization = atom.GetHybridization()
-        chirality = atom.GetChiralTag()
-        degree = atom.GetDegree()
-        node_feature = [atomic_num, int(hybridization), int(chirality), degree]
-        node_features.append(node_feature)
-        G.add_node(atom.GetIdx(), features=node_feature)
-    
-    edge_features = []
-    for bond in mol.GetBonds():
-        start_idx = bond.GetBeginAtomIdx()
-        end_idx = bond.GetEndAtomIdx()
-        bond_type = bond.GetBondTypeAsDouble()
-        bond_dir = bond.GetBondDir()
-        aromatic = bond.GetIsAromatic()
-        edge_feature = [bond_type, int(bond_dir), int(aromatic)]
-        edge_features.append(edge_feature)
-        G.add_edge(start_idx, end_idx)
-    
-    node_features = torch.tensor(node_features, dtype=torch.float) # [num_nodes, num_node_features], num_node_features=4
-    edge_index = torch.tensor(list(G.edges), dtype=torch.long).t().contiguous() # [2, num_nodes]
-    edge_attr = torch.tensor(edge_features, dtype=torch.float) # [num_edges, num_edge_features], num_edge_features=3
-
-    return Data(x=node_features, edge_index=edge_index, edge_attr=edge_attr, num_nodes=len(G.nodes), num_edges=len(G.edges))
-
+from utils import *
 
 class AffinityPredictionModel(nn.Module):
     def __init__(self, protein_dim, drug_dim, hidden_dim, attention_dim, capsule_dim):
@@ -137,7 +103,19 @@ def load_dataset(file_path):
 def train_model(model, data_loader, optimizer, criterion, device):
     model.train()
     total_loss = 0
-    loss_fn = WeightedMSELoss(weight=10)
+    loss_fn = AmplifiedLoss(alpha=1.5)
+    
+    affinity_values = torch.cat([batch.affinities for batch in data_loader])
+    affinity_min = affinity_values.min().item()
+    affinity_max = affinity_values.max().item()
+    # print("Main:", affinity_min)
+    # print("Max: ", affinity_max)
+
+    def scale_affinities(affinities):
+        return (affinities - affinity_min) / (affinity_max - affinity_min)
+
+    def inverse_scale_affinities(scaled_affinities):
+        return scaled_affinities * (affinity_max - affinity_min) + affinity_min
     
     with tqdm(data_loader, desc="Training", unit="batch") as pbar:
         for batch in pbar:
@@ -146,24 +124,29 @@ def train_model(model, data_loader, optimizer, criterion, device):
             # graphs = Batch.from_data_list(graphs).to(device)
             sequences = batch.sequences
             affinities = batch.affinities
+            
+            scaled_affinities = scale_affinities(affinities)
 
             optimizer.zero_grad()
             predictions = model(sequences, graphs)
             # loss = criterion(predictions, affinities)
-            loss = loss_fn(predictions, affinities)
+            loss = loss_fn(predictions, scaled_affinities)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
             
             pbar.set_postfix(loss=loss.item())
         
-    return total_loss / len(data_loader)
+    return total_loss / len(data_loader), (affinity_min, affinity_max)
 
-def evaluate_model(model, data_loader, criterion, device, return_predictions=False):
+def evaluate_model(model, data_loader, criterion, device, scaling_params, return_predictions=False):
     model.eval()
     total_loss = 0
     all_preds = []
     all_targets = []
+    affinity_min, affinity_max = scaling_params
+    def inverse_scale_affinities(scaled_affinities):
+        return scaled_affinities * (affinity_max - affinity_min) + affinity_min
     
     with tqdm(data_loader, desc="Evaluating", unit="batch") as pbar:
         with torch.no_grad():
@@ -173,10 +156,11 @@ def evaluate_model(model, data_loader, criterion, device, return_predictions=Fal
                 affinities = batch.affinities.to(device)
                 
                 predictions = model(sequences, batch)
-                loss = criterion(predictions, affinities)
+                predictions_rescaled = inverse_scale_affinities(predictions)
+                loss = criterion(predictions_rescaled, affinities)
                 total_loss += loss.item()
                 
-                all_preds.extend(predictions.cpu().numpy())
+                all_preds.extend(predictions_rescaled.cpu().numpy())
                 all_targets.extend(affinities.cpu().numpy())
                 
                 pbar.set_postfix(loss=loss.item())
@@ -188,117 +172,6 @@ def evaluate_model(model, data_loader, criterion, device, return_predictions=Fal
         return avg_loss, metrics, np.array(all_preds), np.array(all_targets)
     
     return avg_loss, metrics
-
-# Checkpoints
-
-def save_checkpoint(model, optimizer, epoch, loss, checkpoint_dir="checkpoints"):
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
-    checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch + 1}_loss_{loss:.4f}.pt")
-    torch.save({
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
-    }, checkpoint_path)
-    print(f"Checkpoint saved: {checkpoint_path}")
-
-def load_checkpoint(model, optimizer, checkpoint_path):
-    checkpoint = torch.load(checkpoint_path)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    epoch = checkpoint['epoch']
-    loss = checkpoint['loss']
-    print(f"Checkpoint loaded: {checkpoint_path}, Epoch: {epoch+1}, Loss: {loss:.4f}")
-    return model, optimizer, epoch, loss
-
-
-class EarlyStopping:
-    def __init__(self, patience=5, verbose=False, checkpoint_dir="E:/AIDD_project/checkpoints/early_stop"):
-        """
-        Args:
-            patience (int): Number of epochs to wait for improvement before stopping.
-            verbose (bool): Print a message when training stops early.
-            checkpoint_path (str): Path to save the best model.
-        """
-        self.patience = patience
-        self.verbose = verbose
-        self.best_loss = float('inf')
-        self.counter = 0
-        self.early_stop = False
-        self.checkpoint_path = os.path.join(checkpoint_dir, "best_model.pt")
-
-    def __call__(self, val_loss, model, optimizer, epoch):
-        if val_loss < self.best_loss:
-            self.best_loss = val_loss
-            self.counter = 0
-            # Save the best model
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': val_loss,
-            }, self.checkpoint_path)
-            if self.verbose:
-                print(f"Validation loss improved. Model saved to {self.checkpoint_path}")
-        else:
-            self.counter += 1
-            if self.verbose:
-                print(f"EarlyStopping counter: {self.counter} / {self.patience}")
-            if self.counter >= self.patience:
-                self.early_stop = True
-                if self.verbose:
-                    print("Early stopping triggered.")
-
-
-def compute_metrics(y_true, y_pred):
-    mse = mean_squared_error(y_true, y_pred)
-    rmse = np.sqrt(mse)
-    r2 = r2_score(y_true, y_pred)
-    ci = concordance_index(y_true, y_pred)
-    return {
-        "MSE": mse,
-        "RMSE": rmse,
-        "R^2": r2,
-        "CI": ci
-    }
-
-def log_file(epoch, train_loss, test_loss, metrics, file_path):
-    with open(file_path, "a", encoding="utf-8") as f:
-        f.write(f"Epoch {epoch}: Train Loss = {train_loss:.4f}, Test Loss = {test_loss:.4f}, "
-                f"MSE = {metrics['MSE']:.4f}, RMSE = {metrics['RMSE']:.4f}, R² = {metrics['R²']:.4f}\n")
-
-def save_predictions(smiles, sequences, predictions, ground_truths, output_path):
-    data = {
-        "SMILES": smiles,
-        "Sequence": sequences,
-        "Predicted Affinity": predictions,
-        "Ground Truth Affinity": ground_truths
-    }
-    df = pd.DataFrame(data)
-    df.to_csv(output_path, index=False)
-    print(f"Predictions saved to {output_path}")
-
-def plot_affinity_scatter(predictions, ground_truths, output_file="affinity_scatter_plot.png"):
-    plt.figure(figsize=(8, 8))
-    plt.scatter(predictions, ground_truths, alpha=0.7, edgecolor='k')
-    plt.plot([min(ground_truths), max(ground_truths)],
-             [min(ground_truths), max(ground_truths)], 'r--', lw=2)  # Line y=x for reference
-    plt.title("Affinity Predictions vs Ground Truths", fontsize=14)
-    plt.xlabel("Predicted Affinity", fontsize=12)
-    plt.ylabel("Ground Truth Affinity", fontsize=12)
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    # plt.show()
-    
-class WeightedMSELoss(nn.Module):
-    def __init__(self, weight=10):
-        super(WeightedMSELoss, self).__init__()
-        self.weight = weight
-
-    def forward(self, preds, targets):
-        weights = torch.where(targets > 5, self.weight, 1.0)
-        return torch.mean(weights * (preds - targets) ** 2)
 
 
 # Main Execution
@@ -357,8 +230,8 @@ if __name__ == "__main__":
         affinities = torch.tensor([item[2] for item in batch], dtype=torch.float)
         return graphs, sequences, affinities
 
-    train_loader = DataLoader(train_data, batch_size=32, shuffle=True, collate_fn=custom_collate)
-    test_loader = DataLoader(test_data, batch_size=32, shuffle=False, collate_fn=custom_collate)
+    train_loader = DataLoader(train_data, batch_size=64, shuffle=True, collate_fn=custom_collate)
+    test_loader = DataLoader(test_data, batch_size=64, shuffle=False, collate_fn=custom_collate)
     
     # for batch in train_loader:
     #     print(batch)
@@ -379,7 +252,7 @@ if __name__ == "__main__":
     start_epoch = -1
     
     # # load
-    # model, optimizer, start_epoch, _ = load_checkpoint(model, optimizer, "E:/AIDD_project/checkpoints/epoch_2_loss_0.7925.pt")
+    # model, optimizer, start_epoch, _ = load_checkpoint(model, optimizer, "E:/AIDD_project/checkpoints/epoch_1_loss_1.1149.pt")
     
     log_file_path = "training_log.txt"
 
@@ -387,8 +260,8 @@ if __name__ == "__main__":
     epochs = 10 # 50
     for epoch in range(start_epoch + 1, epochs):
         print(f"Epoch {epoch + 1}/{epochs}")
-        train_loss = train_model(model, train_loader, optimizer, criterion, device)
-        test_loss, test_metrics, predictions, ground_truths = evaluate_model(model, test_loader, criterion, device, return_predictions=True)
+        train_loss, scaling_params = train_model(model, train_loader, optimizer, criterion, device)
+        test_loss, test_metrics, predictions, ground_truths = evaluate_model(model, test_loader, criterion, device, scaling_params, return_predictions=True)
         
         plot_affinity_scatter(predictions, ground_truths, f"affinity_scatter_epoch_{epoch+1}.png")
         
