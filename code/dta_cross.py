@@ -230,8 +230,8 @@ if __name__ == "__main__":
         affinities = torch.tensor([item[2] for item in batch], dtype=torch.float)
         return graphs, sequences, affinities
 
-    train_loader = DataLoader(train_data, batch_size=64, shuffle=True, collate_fn=custom_collate)
-    test_loader = DataLoader(test_data, batch_size=64, shuffle=False, collate_fn=custom_collate)
+    train_loader = DataLoader(train_data, batch_size=32, shuffle=True, collate_fn=custom_collate)
+    test_loader = DataLoader(test_data, batch_size=32, shuffle=False, collate_fn=custom_collate)
     
     # for batch in train_loader:
     #     print(batch)
@@ -265,15 +265,15 @@ if __name__ == "__main__":
         
         plot_affinity_scatter(predictions, ground_truths, f"affinity_scatter_epoch_{epoch+1}.png")
         
-        # Save predictions
-        if epoch == epochs - 1:
-            save_predictions(
-                [smiles_test[i] for i in range(len(smiles_test))],
-                [sequences[test_idx[i]] for i in range(len(test_idx))],
-                predictions,
-                ground_truths,
-                "test_results.csv"
-            )
+        # # Save predictions
+        # if epoch == epochs - 1:
+        #     save_predictions(
+        #         [smiles_test[i] for i in range(len(smiles_test))],
+        #         [sequences[test_idx[i]] for i in range(len(test_idx))],
+        #         predictions,
+        #         ground_truths,
+        #         "test_results.csv"
+        #     )
         
         
         print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}")
