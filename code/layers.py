@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv, GINEConv, global_mean_pool
-from torch_geometric.nn import global_add_pool, global_max_pool
+from torch_geometric.nn import global_add_pool, global_max_pool, global_mean_pool
 from torch.nn.functional import softmax
 from transformers import BertModel, BertTokenizer
 from transformers import AutoModel, AutoTokenizer
@@ -54,16 +54,33 @@ class GNNEncoder(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, output_dim)
         ), edge_dim=edge_dim)
+        
+        self.batchnorm1 = nn.BatchNorm1d(hidden_dim)
+        self.batchnorm2 = nn.BatchNorm1d(output_dim)
+        self.dropout = nn.Dropout(p=0.2)
+        
+        self.proj1 = nn.Linear(input_dim, hidden_dim)
+        self.proj2 = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x, edge_index, edge_attr, batch):
+        # residual
+        residual1 = self.proj1(x)
         x = self.conv1(x, edge_index, edge_attr).relu()
+        x = self.batchnorm1(x)
+        x = self.dropout(x)
+        x = x + residual1
+        
+        residual2 = self.proj2(x)
         x = self.conv2(x, edge_index, edge_attr).relu()
+        x = self.batchnorm2(x)
+        x = self.dropout(x)
+        x = x + residual2
         
         device = x.device
         # batch = torch.zeros(x.size(0), dtype=torch.long, device=device)
         # print(f"Batch tensor: {batch}")
         # print(f"Batch tensor shape: {batch.shape}")
-        return global_mean_pool(x, batch)
+        return global_add_pool(x, batch)  # mean / max
         # return global_mean_pool(x, torch.zeros(x.size(0), dtype=torch.long))
 
 

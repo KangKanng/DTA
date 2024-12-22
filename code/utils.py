@@ -80,7 +80,7 @@ def load_checkpoint(model, optimizer, checkpoint_path):
 
 
 class EarlyStopping:
-    def __init__(self, patience=5, verbose=False, checkpoint_dir="E:/AIDD_project/checkpoints/early_stop"):
+    def __init__(self, patience=5, verbose=False, checkpoint_dir="E:/AIDD_project/checkpoints/best_model"):
         """
         Args:
             patience (int): Number of epochs to wait for improvement before stopping.
