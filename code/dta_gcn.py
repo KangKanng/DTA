@@ -318,7 +318,7 @@ if __name__ == "__main__":
     # load
     model, optimizer, start_epoch, _ = load_checkpoint(model, optimizer, "E:/AIDD_project/checkpoints/epoch_2_loss_0.7925.pt")
     
-    log_file_path = "training_log.txt"
+    log_file_path = "training_log.json"
 
     # Training loop
     epochs = 10 # 50
